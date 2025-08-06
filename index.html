@@ -35,9 +35,37 @@
         .modal-overlay {
             background-color: rgba(0, 0, 0, 0.7);
         }
+        .loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(255, 255, 255, 0.8);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 9999;
+        }
+        .spinner {
+            border: 4px solid rgba(0, 0, 0, 0.1);
+            border-left-color: #6366f1;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
     </style>
 </head>
 <body class="flex h-screen overflow-hidden">
+
+    <!-- Loading Overlay -->
+    <div id="loading-overlay" class="loading-overlay hidden">
+        <div class="spinner"></div>
+    </div>
 
     <!-- Login Page -->
     <div id="login-page" class="flex items-center justify-center h-screen w-full bg-gradient-to-br from-purple-600 to-blue-500">
@@ -102,7 +130,7 @@
                 <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
                     <!-- Product Buttons -->
                     <div class="lg:col-span-2">
-                        <h3 class="text-2xl font-semibold text-gray-700 mb-4">Pilih Item</h3>
+                        <h3 class="2xl font-semibold text-gray-700 mb-4">Pilih Item</h3>
                         <div class="grid grid-cols-2 md:grid-cols-3 gap-4">
                             <button class="product-button bg-blue-500 hover:bg-blue-600 text-white font-bold py-4 px-6 rounded-lg shadow-md transition duration-200 transform hover:scale-105" data-item-type="product" data-item-name="Kopi" data-item-price="5000">
                                 Kopi <br> Rp 5.000
@@ -277,8 +305,25 @@
         </div>
     </div>
 
-    <script>
-        // Data Karyawan (shift akan ditentukan secara dinamis saat login)
+    <script type="module">
+        // Firebase SDK Imports
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, setDoc, addDoc, updateDoc, deleteDoc, onSnapshot, collection, query, where, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global variables provided by Canvas environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // Initialize Firebase
+        let app;
+        let db;
+        let auth;
+        let userId = null;
+        let isAuthReady = false; // Flag to ensure Firestore operations wait for auth
+
+        // Data Karyawan (shift will be determined dynamically on login)
         const employees = [
             { name: 'Dibta' },
             { name: 'Nano' },
@@ -287,7 +332,7 @@
             { name: 'Santi' },
         ];
 
-        // Data Produk dan Denda
+        // Product and Fine Data
         const products = [
             { name: 'Kopi', price: 5000, type: 'drink' },
             { name: 'Teh', price: 5000, type: 'drink' },
@@ -300,16 +345,18 @@
             { name: 'Denda Senar Gitar', price: 10000 },
         ];
 
-        const studioPrice = 85000; // Harga sewa studio per 2 jam
+        const studioPrice = 85000; // Studio rent price per 2 hours
 
-        // State Aplikasi
+        // Application State (currentCart remains local as it's a temporary shopping cart)
         let loggedInUser = null;
         let currentCart = [];
-        let transactions = []; // Menyimpan semua transaksi
-        let stock = {}; // Menyimpan stok minuman dan aksesoris
-        let attendance = []; // Menyimpan data presensi
+        let transactions = []; // Will be populated by onSnapshot
+        let stock = {}; // Will be populated by onSnapshot
+        let attendance = []; // Will be populated by onSnapshot
+        let bookedStudioSlots = []; // New: Will be populated by onSnapshot for studio slots
 
-        // Elemen DOM
+        // DOM Elements
+        const loadingOverlay = document.getElementById('loading-overlay');
         const loginPage = document.getElementById('login-page');
         const mainApp = document.getElementById('main-app');
         const usernameInput = document.getElementById('username');
@@ -363,9 +410,23 @@
         // --- Utility Functions ---
 
         /**
-         * Mengubah angka menjadi format Rupiah.
-         * @param {number} amount - Jumlah uang.
-         * @returns {string} Format Rupiah.
+         * Shows the loading overlay.
+         */
+        function showLoading() {
+            loadingOverlay.classList.remove('hidden');
+        }
+
+        /**
+         * Hides the loading overlay.
+         */
+        function hideLoading() {
+            loadingOverlay.classList.add('hidden');
+        }
+
+        /**
+         * Formats a number as Rupiah currency.
+         * @param {number} amount - The amount of money.
+         * @returns {string} Formatted Rupiah string.
          */
         function formatRupiah(amount) {
             return new Intl.NumberFormat('id-ID', {
@@ -376,8 +437,8 @@
         }
 
         /**
-         * Mendapatkan tanggal dan waktu saat ini dalam format yang mudah dibaca.
-         * @returns {string} Tanggal dan waktu.
+         * Gets the current date and time in a readable format.
+         * @returns {string} Current date and time.
          */
         function getCurrentDateTime() {
             const now = new Date();
@@ -390,10 +451,10 @@
         }
 
         /**
-         * Menampilkan modal kustom (alert/konfirmasi).
-         * @param {string} title - Judul modal.
-         * @param {string} message - Pesan modal.
-         * @param {boolean} isConfirm - Apakah ini modal konfirmasi (true) atau alert (false).
+         * Displays a custom modal (alert/confirmation).
+         * @param {string} title - Modal title.
+         * @param {string} message - Modal message.
+         * @param {boolean} isConfirm - Whether it's a confirmation modal (true) or alert (false).
          * @returns {Promise<boolean>} Resolves true if confirmed, false if cancelled.
          */
         function showAlert(title, message, isConfirm = false) {
@@ -440,46 +501,139 @@
             });
         }
 
-
-        // --- Data Persistence (localStorage) ---
-
-        /**
-         * Menyimpan semua data aplikasi ke localStorage.
-         */
-        function saveData() {
-            localStorage.setItem('geganaPOS_cart', JSON.stringify(currentCart));
-            localStorage.setItem('geganaPOS_transactions', JSON.stringify(transactions));
-            localStorage.setItem('geganaPOS_stock', JSON.stringify(stock));
-            localStorage.setItem('geganaPOS_attendance', JSON.stringify(attendance));
-            localStorage.setItem('geganaPOS_loggedInUser', JSON.stringify(loggedInUser));
-        }
+        // --- Firebase Initialization & Authentication ---
 
         /**
-         * Memuat semua data aplikasi dari localStorage.
+         * Initializes Firebase and sets up authentication listener.
          */
-        function loadData() {
-            currentCart = JSON.parse(localStorage.getItem('geganaPOS_cart')) || [];
-            transactions = JSON.parse(localStorage.getItem('geganaPOS_transactions')) || [];
-            stock = JSON.parse(localStorage.getItem('geganaPOS_stock')) || initializeStock();
-            attendance = JSON.parse(localStorage.getItem('geganaPOS_attendance')) || [];
-            loggedInUser = JSON.parse(localStorage.getItem('geganaPOS_loggedInUser'));
+        async function initializeFirebase() {
+            showLoading();
+            try {
+                app = initializeApp(firebaseConfig);
+                auth = getAuth(app);
+                db = getFirestore(app);
 
-            if (loggedInUser) {
-                showMainApp();
-            } else {
-                showLoginPage();
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        isAuthReady = true;
+                        // Fetch user data (if any) or create new anonymous user profile
+                        const userDocRef = doc(db, `artifacts/${appId}/users/${userId}/profile`, 'user_data');
+                        const userDocSnap = await getDoc(userDocRef);
+                        if (!userDocSnap.exists()) {
+                            await setDoc(userDocRef, {
+                                createdAt: getCurrentDateTime(),
+                                lastLogin: getCurrentDateTime(),
+                                // You might add more user-specific data here later
+                            });
+                        } else {
+                            await updateDoc(userDocRef, {
+                                lastLogin: getCurrentDateTime()
+                            });
+                        }
+                        // Start real-time listeners for data
+                        setupFirestoreListeners();
+                        if (loggedInUser) { // Only show main app if a specific employee logged in via form
+                            showMainApp();
+                        } else {
+                            showLoginPage(); // If just anonymous login, show login form
+                        }
+                    } else {
+                        userId = null;
+                        isAuthReady = false;
+                        loggedInUser = null;
+                        currentCart = [];
+                        transactions = [];
+                        stock = {};
+                        attendance = [];
+                        bookedStudioSlots = [];
+                        showLoginPage();
+                    }
+                    hideLoading();
+                });
+
+                // Sign in if not already authenticated
+                if (!auth.currentUser) {
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(auth, initialAuthToken);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                }
+            } catch (error) {
+                console.error("Error initializing Firebase or signing in:", error);
+                showAlert('Error', 'Gagal menginisialisasi aplikasi. Silakan coba lagi.');
+                hideLoading();
             }
         }
 
         /**
-         * Menginisialisasi stok awal jika belum ada di localStorage.
-         * @returns {object} Objek stok awal.
+         * Sets up real-time listeners for Firestore data.
          */
-        function initializeStock() {
+        function setupFirestoreListeners() {
+            if (!isAuthReady || !userId) return;
+
+            // Listener for Stock (private to user)
+            const stockDocRef = doc(db, `artifacts/${appId}/users/${userId}/stock`, 'currentStock');
+            onSnapshot(stockDocRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    stock = docSnap.data();
+                } else {
+                    // Initialize stock if it doesn't exist
+                    stock = initializeStockData();
+                    setDoc(stockDocRef, stock); // Create initial stock document
+                }
+                renderStockInputs(); // Re-render stock inputs with updated data
+            }, (error) => {
+                console.error("Error fetching stock:", error);
+                showAlert('Error', 'Gagal memuat data stok.');
+            });
+
+            // Listener for Transactions (private to user)
+            const transactionsColRef = collection(db, `artifacts/${appId}/users/${userId}/transactions`);
+            onSnapshot(transactionsColRef, (snapshot) => {
+                transactions = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                // Sort transactions by timestamp (descending) for display
+                transactions.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+                renderTransactions();
+            }, (error) => {
+                console.error("Error fetching transactions:", error);
+                showAlert('Error', 'Gagal memuat data transaksi.');
+            });
+
+            // Listener for Attendance (private to user)
+            const attendanceColRef = collection(db, `artifacts/${appId}/users/${userId}/attendance`);
+            onSnapshot(attendanceColRef, (snapshot) => {
+                attendance = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                // Sort attendance by loginTime (descending)
+                attendance.sort((a, b) => new Date(b.loginTime) - new Date(a.loginTime));
+                renderAttendance();
+            }, (error) => {
+                console.error("Error fetching attendance:", error);
+                showAlert('Error', 'Gagal memuat data presensi.');
+            });
+
+            // NEW: Listener for Booked Studio Slots (public)
+            // Corrected path: artifacts/{appId}/public/data/booked_studio_slots
+            const bookedSlotsColRef = collection(db, `artifacts/${appId}/public/data/booked_studio_slots`);
+            onSnapshot(bookedSlotsColRef, (snapshot) => {
+                bookedStudioSlots = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                generateTimeSlots(); // Re-render time slots with updated booking status
+            }, (error) => {
+                console.error("Error fetching booked studio slots:", error);
+                showAlert('Error', 'Gagal memuat data booking studio.');
+            });
+        }
+
+        /**
+         * Initializes initial stock data for Firestore if not exists.
+         * @returns {object} Initial stock object.
+         */
+        function initializeStockData() {
             const initialStock = {};
             products.forEach(p => {
                 if (p.type === 'drink' || p.type === 'accessory') {
-                    initialStock[p.name] = 10; // Stok awal 10 untuk semua minuman dan stick drum
+                    initialStock[p.name] = 10; // Initial stock 10 for all drinks and drum sticks
                 }
             });
             return initialStock;
@@ -488,7 +642,7 @@
         // --- Login & Logout ---
 
         /**
-         * Menampilkan halaman login.
+         * Displays the login page.
          */
         function showLoginPage() {
             loginPage.classList.remove('hidden');
@@ -498,21 +652,22 @@
         }
 
         /**
-         * Menampilkan aplikasi utama setelah login berhasil.
+         * Displays the main application after successful login.
          */
         function showMainApp() {
             loginPage.classList.add('hidden');
             mainApp.classList.remove('hidden');
             loggedInUserSpan.textContent = loggedInUser.name;
-            showSection('pos'); // Tampilkan bagian POS secara default
+            showSection('pos'); // Display POS section by default
             renderCart();
-            renderStockInputs(); // Render stock inputs on load
+            // renderStockInputs() and others are called by setupFirestoreListeners
         }
 
         /**
-         * Menangani proses login karyawan.
+         * Handles employee login process.
          */
-        loginButton.addEventListener('click', () => {
+        loginButton.addEventListener('click', async () => {
+            showLoading();
             const username = usernameInput.value.trim();
             const password = passwordInput.value.trim();
 
@@ -533,53 +688,77 @@
 
                 loggedInUser = {
                     name: employee.name,
-                    shift: assignedShift, // Use the dynamically assigned shift
+                    shift: assignedShift,
                     loginTime: getCurrentDateTime()
                 };
-                // Check if already logged in for attendance to avoid duplicate entries on refresh
-                const existingAttendance = attendance.find(
-                    att => att.name === loggedInUser.name && !att.logoutTime
-                );
-                if (!existingAttendance) {
-                    attendance.push({ ...loggedInUser });
-                } else {
-                    // If user refreshed, update login time if needed, or just keep existing
-                    existingAttendance.loginTime = loggedInUser.loginTime;
-                    existingAttendance.shift = assignedShift; // Update shift in case user logs in at different time
+
+                try {
+                    const attendanceColRef = collection(db, `artifacts/${appId}/users/${userId}/attendance`);
+                    const q = query(attendanceColRef, where("name", "==", loggedInUser.name), where("logoutTime", "==", null));
+                    const querySnapshot = await getDocs(q);
+
+                    if (querySnapshot.empty) {
+                        // No active session, add new attendance record
+                        await addDoc(attendanceColRef, { ...loggedInUser });
+                    } else {
+                        // User already logged in on this anonymous session, update existing record
+                        const docToUpdate = querySnapshot.docs[0];
+                        await updateDoc(doc(attendanceColRef, docToUpdate.id), {
+                            loginTime: loggedInUser.loginTime,
+                            shift: assignedShift
+                        });
+                    }
+                    showMainApp();
+                } catch (e) {
+                    console.error("Error during attendance logging:", e);
+                    showAlert('Error', 'Gagal mencatat presensi. Silakan coba lagi.');
+                } finally {
+                    hideLoading();
                 }
-                saveData();
-                showMainApp();
             } else {
+                hideLoading();
                 showAlert('Login Gagal', 'Username atau password salah. Pastikan username dan password sama dengan nama karyawan.');
             }
         });
 
         /**
-         * Menangani proses logout karyawan.
+         * Handles employee logout process.
          */
         logoutButton.addEventListener('click', async () => {
             const confirmLogout = await showAlert('Konfirmasi Logout', 'Apakah Anda yakin ingin logout?', true);
             if (confirmLogout) {
-                if (loggedInUser) {
-                    const latestAttendance = attendance.find(
-                        att => att.name === loggedInUser.name && !att.logoutTime
-                    );
-                    if (latestAttendance) {
-                        latestAttendance.logoutTime = getCurrentDateTime();
+                showLoading();
+                try {
+                    if (loggedInUser && userId) {
+                        const attendanceColRef = collection(db, `artifacts/${appId}/users/${userId}/attendance`);
+                        const q = query(attendanceColRef, where("name", "==", loggedInUser.name), where("logoutTime", "==", null));
+                        const querySnapshot = await getDocs(q);
+
+                        if (!querySnapshot.empty) {
+                            const docToUpdate = querySnapshot.docs[0];
+                            await updateDoc(doc(attendanceColRef, docToUpdate.id), {
+                                logoutTime: getCurrentDateTime()
+                            });
+                        }
                     }
+                    await signOut(auth); // Sign out from Firebase Auth
+                    loggedInUser = null;
+                    currentCart = []; // Clear cart on logout
+                    showLoginPage(); // onAuthStateChanged will handle showing login page
+                } catch (e) {
+                    console.error("Error during logout:", e);
+                    showAlert('Error', 'Gagal logout. Silakan coba lagi.');
+                } finally {
+                    hideLoading();
                 }
-                loggedInUser = null;
-                currentCart = []; // Clear cart on logout
-                saveData();
-                showLoginPage();
             }
         });
 
         // --- Navigation ---
 
         /**
-         * Menampilkan bagian aplikasi yang dipilih.
-         * @param {string} sectionId - ID bagian yang akan ditampilkan (pos, booking, stock, reports).
+         * Displays the selected application section.
+         * @param {string} sectionId - ID of the section to display (pos, booking, stock, reports).
          */
         function showSection(sectionId) {
             posSection.classList.add('hidden');
@@ -605,13 +784,13 @@
                 case 'stock':
                     stockSection.classList.remove('hidden');
                     navStock.classList.add('bg-gray-700');
-                    renderStockInputs(); // Render stock inputs when stock section is shown
+                    renderStockInputs(); // Render stock inputs with current Firestore data
                     break;
                 case 'reports':
                     reportsSection.classList.remove('hidden');
                     navReports.classList.add('bg-gray-700');
-                    renderTransactions(); // Render transactions when reports section is shown
-                    renderAttendance(); // Render attendance when reports section is shown
+                    renderTransactions(); // Render transactions with current Firestore data
+                    renderAttendance(); // Render attendance with current Firestore data
                     break;
             }
         }
@@ -624,7 +803,7 @@
         // --- POS Logic ---
 
         /**
-         * Merender item di keranjang belanja.
+         * Renders items in the shopping cart.
          */
         function renderCart() {
             cartItemsContainer.innerHTML = '';
@@ -681,12 +860,11 @@
                     removeItemFromCart(index);
                 });
             });
-            saveData();
         }
 
         /**
-         * Menambahkan item ke keranjang belanja.
-         * @param {object} item - Objek item yang akan ditambahkan.
+         * Adds an item to the shopping cart.
+         * @param {object} item - The item object to add.
          */
         function addItemToCart(item) {
             const existingItemIndex = currentCart.findIndex(cartItem => cartItem.name === item.name);
@@ -700,9 +878,9 @@
         }
 
         /**
-         * Memperbarui kuantitas item di keranjang.
-         * @param {number} index - Indeks item di keranjang.
-         * @param {string} action - 'increase' atau 'decrease'.
+         * Updates the quantity of an item in the cart.
+         * @param {number} index - Index of the item in the cart.
+         * @param {string} action - 'increase' or 'decrease'.
          */
         function updateItemQuantity(index, action) {
             if (action === 'increase') {
@@ -718,17 +896,21 @@
         }
 
         /**
-         * Menghapus item dari keranjang belanja.
-         * @param {number} index - Indeks item yang akan dihapus.
+         * Removes an item from the shopping cart.
+         * @param {number} index - Index of the item to remove.
          */
         function removeItemFromCart(index) {
             currentCart.splice(index, 1);
             renderCart();
         }
 
-        // Event listener untuk tombol produk/denda
+        // Event listener for product/fine buttons
         productButtons.forEach(button => {
-            button.addEventListener('click', (e) => {
+            button.addEventListener('click', async (e) => {
+                if (!isAuthReady) {
+                    showAlert('Autentikasi Belum Siap', 'Sistem sedang memuat. Mohon tunggu sebentar.');
+                    return;
+                }
                 const itemType = e.currentTarget.dataset.itemType;
                 const itemName = e.currentTarget.dataset.itemName;
                 const itemPrice = parseInt(e.currentTarget.dataset.itemPrice);
@@ -738,9 +920,8 @@
                 // Handle stock for drinks and accessories
                 if (itemType === 'product' && (itemName === 'Kopi' || itemName === 'Teh' || itemName === 'Air Putih' || itemName === 'Stick Drum')) {
                     if (stock[itemName] && stock[itemName] > 0) {
-                        stock[itemName]--;
+                        // Stock is managed by Firestore listener, no direct decrement here
                         addItemToCart(itemToAdd);
-                        saveData(); // Save stock immediately after decrementing
                     } else {
                         showAlert('Stok Habis', `Maaf, stok ${itemName} sudah habis.`);
                     }
@@ -753,9 +934,17 @@
         // --- Checkout & Payment Modal ---
 
         /**
-         * Menampilkan modal pembayaran.
+         * Displays the payment modal.
          */
         checkoutButton.addEventListener('click', () => {
+            if (!isAuthReady) {
+                showAlert('Autentikasi Belum Siap', 'Sistem sedang memuat. Mohon tunggu sebentar.');
+                return;
+            }
+            if (!loggedInUser) {
+                showAlert('Login Diperlukan', 'Mohon login sebagai karyawan terlebih dahulu untuk melakukan transaksi.');
+                return;
+            }
             if (currentCart.length === 0) {
                 showAlert('Keranjang Kosong', 'Tidak ada item di keranjang untuk dibayar.');
                 return;
@@ -770,7 +959,7 @@
         });
 
         /**
-         * Menutup modal pembayaran.
+         * Closes the payment modal.
          */
         closePaymentModalButton.addEventListener('click', () => {
             paymentModalContent.classList.remove('opacity-100', 'scale-100');
@@ -779,37 +968,95 @@
         });
 
         /**
-         * Memproses pembayaran.
-         * @param {string} method - Metode pembayaran (Cash, Transfer, QRIS).
+         * Processes payment and saves transaction to Firestore.
+         * Also decrements product stock and marks studio slots as booked.
          */
         paymentMethodButtons.forEach(button => {
             button.addEventListener('click', async (e) => {
+                showLoading();
                 const paymentMethod = e.currentTarget.dataset.method;
                 const total = currentCart.reduce((sum, item) => sum + (item.price * item.quantity), 0);
 
-                const transactionId = `TRX-${Date.now()}`;
-                transactions.push({
-                    id: transactionId,
+                const transactionData = {
                     timestamp: getCurrentDateTime(),
                     employee: loggedInUser ? loggedInUser.name : 'Unknown',
-                    items: [...currentCart], // Salin keranjang saat ini
+                    items: JSON.parse(JSON.stringify(currentCart)), // Deep copy current cart
                     total: total,
                     paymentMethod: paymentMethod,
                     status: 'Completed'
-                });
+                };
 
-                currentCart = []; // Kosongkan keranjang
-                saveData();
-                renderCart();
-                closePaymentModalButton.click(); // Tutup modal pembayaran
-                await showAlert('Pembayaran Berhasil!', `Transaksi ${transactionId} berhasil dengan total ${formatRupiah(total)} menggunakan metode ${paymentMethod}.`);
+                try {
+                    // Update stock in Firestore for items in cart
+                    const stockDocRef = doc(db, `artifacts/${appId}/users/${userId}/stock`, 'currentStock');
+                    const updatedStock = { ...stock }; // Copy current stock from state
+
+                    for (const item of currentCart) {
+                        if (item.type === 'product' && (item.name === 'Kopi' || item.name === 'Teh' || item.name === 'Air Putih' || item.name === 'Stick Drum')) {
+                            if (updatedStock[item.name] !== undefined) {
+                                updatedStock[item.name] -= item.quantity;
+                                if (updatedStock[item.name] < 0) updatedStock[item.name] = 0; // Prevent negative stock
+                            }
+                        }
+                    }
+                    await setDoc(stockDocRef, updatedStock); // Update the entire stock document
+
+                    // NEW: Handle studio booking and mark slot as booked in public collection
+                    // Corrected path: artifacts/{appId}/public/data/booked_studio_slots
+                    const bookedSlotsColRef = collection(db, `artifacts/${appId}/public/data/booked_studio_slots`);
+                    for (let i = 0; i < transactionData.items.length; i++) {
+                        const item = transactionData.items[i];
+                        if (item.type === 'studio_booking') {
+                            const match = item.name.match(/\(([^)]+)\s([^)]+)\)-/); // Extract date and time from name
+                            if (match && match[1] && match[2]) {
+                                const [datePart, timeRange] = match[1].split(' ');
+                                const [startTime, endTime] = timeRange.split('-');
+
+                                const bookedSlotDoc = await addDoc(bookedSlotsColRef, {
+                                    date: datePart,
+                                    startTime: startTime,
+                                    endTime: endTime,
+                                    customerName: item.name.split(' - ')[1], // Extract customer name
+                                    transactionId: '', // Will be updated after transaction is added
+                                    status: 'booked',
+                                    bookedAt: getCurrentDateTime()
+                                });
+                                // Store the booked slot ID back into the transaction item
+                                transactionData.items[i].bookedSlotId = bookedSlotDoc.id;
+                            }
+                        }
+                    }
+
+                    // Add transaction to Firestore
+                    const transactionsColRef = collection(db, `artifacts/${appId}/users/${userId}/transactions`);
+                    const newTransactionDoc = await addDoc(transactionsColRef, transactionData);
+
+                    // NEW: Update booked studio slots with the transaction ID
+                    // Corrected path: artifacts/{appId}/public/data/booked_studio_slots
+                    for (const item of transactionData.items) {
+                        if (item.type === 'studio_booking' && item.bookedSlotId) {
+                            const bookedSlotDocRef = doc(db, `artifacts/${appId}/public/data/booked_studio_slots`, item.bookedSlotId);
+                            await updateDoc(bookedSlotDocRef, { transactionId: newTransactionDoc.id });
+                        }
+                    }
+
+                    currentCart = []; // Clear local cart
+                    renderCart();
+                    closePaymentModalButton.click(); // Close payment modal
+                    await showAlert('Pembayaran Berhasil!', `Transaksi berhasil dengan total ${formatRupiah(total)} menggunakan metode ${paymentMethod}.`);
+                } catch (error) {
+                    console.error("Error processing payment or updating stock/booking:", error);
+                    showAlert('Error', 'Gagal memproses pembayaran atau memperbarui stok/booking. Silakan coba lagi.');
+                } finally {
+                    hideLoading();
+                }
             });
         });
 
         // --- Booking Studio Logic ---
 
         /**
-         * Menginisialisasi input tanggal booking dengan tanggal hari ini.
+         * Initializes the booking date input with today's date.
          */
         function initializeBookingDate() {
             const today = new Date();
@@ -820,7 +1067,7 @@
         }
 
         /**
-         * Menghasilkan slot waktu studio berdasarkan tanggal yang dipilih.
+         * Generates studio time slots based on the selected date and current booked slots.
          */
         function generateTimeSlots() {
             timeSlotsContainer.innerHTML = '';
@@ -842,21 +1089,37 @@
 
                 const isPast = selectedDate === todayStr && slotDateTime < now;
 
+                // Check if this slot is booked in Firestore
+                const isBooked = bookedStudioSlots.some(bookedSlot =>
+                    bookedSlot.date === selectedDate &&
+                    bookedSlot.startTime === `${String(startHour).padStart(2, '0')}:00` &&
+                    bookedSlot.endTime === `${String(endHour % 24).padStart(2, '0')}:00` &&
+                    bookedSlot.status === 'booked'
+                );
+
                 const slotButton = document.createElement('button');
-                slotButton.className = `time-slot-button p-3 rounded-lg font-semibold shadow-md transition duration-200 ${isPast ? 'bg-gray-300 text-gray-600 cursor-not-allowed' : 'bg-blue-100 text-blue-800 hover:bg-blue-200 focus:outline-none focus:ring-2 focus:ring-blue-500'}`;
                 slotButton.textContent = slotText;
                 slotButton.dataset.startTime = `${String(startHour).padStart(2, '0')}:00`;
                 slotButton.dataset.endTime = `${String(endHour % 24).padStart(2, '0')}:00`;
-                slotButton.disabled = isPast;
+                slotButton.dataset.date = selectedDate; // Store date in dataset for easy access
 
-                if (!isPast) {
+                if (isPast || isBooked) {
+                    slotButton.disabled = true;
+                    slotButton.classList.add('bg-red-500', 'text-white', 'cursor-not-allowed', 'opacity-70', 'font-semibold', 'py-3', 'px-4', 'rounded-lg', 'shadow-md');
+                    if (isBooked) {
+                        slotButton.textContent += ' (Booked)';
+                    }
+                } else {
+                    slotButton.classList.add('bg-blue-100', 'text-blue-800', 'hover:bg-blue-200', 'focus:outline-none', 'focus:ring-2', 'focus:ring-blue-500', 'font-semibold', 'py-3', 'px-4', 'rounded-lg', 'shadow-md', 'transition', 'duration-200');
                     slotButton.addEventListener('click', (e) => {
-                        // Hapus highlight dari slot lain
+                        // Remove highlight from other slots
                         document.querySelectorAll('.time-slot-button').forEach(btn => {
-                            btn.classList.remove('bg-blue-500', 'text-white');
-                            btn.classList.add('bg-blue-100', 'text-blue-800');
+                            if (!btn.disabled) { // Only remove highlight from available slots
+                                btn.classList.remove('bg-blue-500', 'text-white');
+                                btn.classList.add('bg-blue-100', 'text-blue-800');
+                            }
                         });
-                        // Highlight slot yang dipilih
+                        // Highlight selected slot
                         e.currentTarget.classList.remove('bg-blue-100', 'text-blue-800');
                         e.currentTarget.classList.add('bg-blue-500', 'text-white');
                     });
@@ -865,13 +1128,22 @@
             }
         }
 
-        // Event listener untuk perubahan tanggal booking
+        // Event listener for booking date change
         bookingDateInput.addEventListener('change', generateTimeSlots);
 
         /**
-         * Menambahkan booking studio ke keranjang.
+         * Adds a studio booking to the cart.
          */
         addBookingToCartButton.addEventListener('click', async () => {
+            if (!isAuthReady) {
+                showAlert('Autentikasi Belum Siap', 'Sistem sedang memuat. Mohon tunggu sebentar.');
+                return;
+            }
+            if (!loggedInUser) {
+                showAlert('Login Diperlukan', 'Mohon login sebagai karyawan terlebih dahulu untuk melakukan booking.');
+                return;
+            }
+
             const selectedDate = bookingDateInput.value;
             const customerName = customerNameInput.value.trim();
             const selectedSlotButton = document.querySelector('.time-slot-button.bg-blue-500');
@@ -888,6 +1160,19 @@
             const startTime = selectedSlotButton.dataset.startTime;
             const endTime = selectedSlotButton.dataset.endTime;
 
+            // Double check if the slot is already booked (real-time update might be slightly delayed)
+            const isAlreadyBooked = bookedStudioSlots.some(bookedSlot =>
+                bookedSlot.date === selectedDate &&
+                bookedSlot.startTime === startTime &&
+                bookedSlot.endTime === endTime &&
+                bookedSlot.status === 'booked'
+            );
+
+            if (isAlreadyBooked) {
+                showAlert('Slot Sudah Terbuka', 'Maaf, slot waktu ini sudah dipesan oleh orang lain. Silakan pilih slot lain.');
+                return;
+            }
+
             const confirmAdd = await showAlert('Konfirmasi Booking', `Tambahkan booking studio untuk ${customerName} pada ${selectedDate}, pukul ${startTime}-${endTime}?`, true);
 
             if (confirmAdd) {
@@ -895,24 +1180,22 @@
                     name: `Sewa Studio (${selectedDate} ${startTime}-${endTime}) - ${customerName}`,
                     price: studioPrice,
                     quantity: 1,
-                    type: 'studio_booking'
+                    type: 'studio_booking',
+                    // bookedSlotId will be added after successful transaction
+                    bookingDetails: { date: selectedDate, startTime: startTime, endTime: endTime, customerName: customerName }
                 };
                 addItemToCart(bookingItem);
                 showAlert('Berhasil', 'Booking studio berhasil ditambahkan ke keranjang!');
                 customerNameInput.value = ''; // Clear customer name
-                // Optionally, disable the booked slot
-                selectedSlotButton.disabled = true;
-                selectedSlotButton.classList.remove('bg-blue-500', 'text-white');
-                selectedSlotButton.classList.add('bg-gray-300', 'text-gray-600', 'cursor-not-allowed');
-                saveData();
-                showSection('pos'); // Kembali ke POS setelah booking
+                // No need to disable button here, it will be disabled by Firestore listener after transaction
+                showSection('pos'); // Return to POS after booking
             }
         });
 
         // --- Stock Management Logic ---
 
         /**
-         * Merender input stok untuk minuman dan aksesoris.
+         * Renders stock inputs for drinks and accessories.
          */
         function renderStockInputs() {
             drinkStockInputsContainer.innerHTML = '';
@@ -940,9 +1223,17 @@
         }
 
         /**
-         * Memperbarui stok berdasarkan input.
+         * Updates stock based on input to Firestore.
          */
         updateStockButton.addEventListener('click', async () => {
+            if (!isAuthReady) {
+                showAlert('Autentikasi Belum Siap', 'Sistem sedang memuat. Mohon tunggu sebentar.');
+                return;
+            }
+            if (!loggedInUser) {
+                showAlert('Login Diperlukan', 'Mohon login sebagai karyawan terlebih dahulu untuk memperbarui stok.');
+                return;
+            }
             const newStock = {};
             products.forEach(p => {
                 if (p.type === 'drink' || p.type === 'accessory') {
@@ -955,16 +1246,24 @@
 
             const confirmUpdate = await showAlert('Konfirmasi Update Stok', 'Apakah Anda yakin ingin memperbarui stok?', true);
             if (confirmUpdate) {
-                stock = newStock;
-                saveData();
-                showAlert('Berhasil', 'Stok berhasil diperbarui!');
+                showLoading();
+                try {
+                    const stockDocRef = doc(db, `artifacts/${appId}/users/${userId}/stock`, 'currentStock');
+                    await setDoc(stockDocRef, newStock); // Overwrite with new stock
+                    showAlert('Berhasil', 'Stok berhasil diperbarui!');
+                } catch (error) {
+                    console.error("Error updating stock:", error);
+                    showAlert('Error', 'Gagal memperbarui stok. Silakan coba lagi.');
+                } finally {
+                    hideLoading();
+                }
             }
         });
 
         // --- Reports Logic ---
 
         /**
-         * Merender daftar transaksi.
+         * Renders the list of transactions from Firestore data.
          */
         function renderTransactions() {
             transactionListBody.innerHTML = '';
@@ -973,11 +1272,11 @@
                 return;
             }
 
-            transactions.forEach((trx, index) => {
+            transactions.forEach((trx) => {
                 const row = document.createElement('tr');
                 row.className = `border-b border-gray-200 hover:bg-gray-50 ${trx.status === 'Cancelled' ? 'bg-red-50 text-red-700 italic' : ''}`;
                 row.innerHTML = `
-                    <td class="py-3 px-6 text-left">${trx.id}</td>
+                    <td class="py-3 px-6 text-left">${trx.id || 'N/A'}</td>
                     <td class="py-3 px-6 text-left">${trx.timestamp}</td>
                     <td class="py-3 px-6 text-left">${trx.employee}</td>
                     <td class="py-3 px-6 text-left">
@@ -1016,21 +1315,45 @@
         }
 
         /**
-         * Membatalkan transaksi.
-         * @param {string} transactionId - ID transaksi yang akan dibatalkan.
+         * Cancels a transaction in Firestore and updates associated booked studio slots.
+         * @param {string} transactionId - ID of the transaction to cancel.
          */
-        function cancelTransaction(transactionId) {
-            const trxIndex = transactions.findIndex(trx => trx.id === transactionId);
-            if (trxIndex > -1) {
-                transactions[trxIndex].status = 'Cancelled';
-                saveData();
-                renderTransactions();
-                showAlert('Berhasil', `Transaksi ${transactionId} berhasil dibatalkan.`);
+        async function cancelTransaction(transactionId) {
+            showLoading();
+            try {
+                const transactionDocRef = doc(db, `artifacts/${appId}/users/${userId}/transactions`, transactionId);
+                const transactionDocSnap = await getDoc(transactionDocRef);
+
+                if (transactionDocSnap.exists()) {
+                    const transactionData = transactionDocSnap.data();
+                    await updateDoc(transactionDocRef, {
+                        status: 'Cancelled'
+                    });
+
+                    // NEW: If the cancelled transaction includes a studio booking, make the slot available again
+                    // Corrected path: artifacts/{appId}/public/data/booked_studio_slots
+                    const bookedSlotsColRef = collection(db, `artifacts/${appId}/public/data/booked_studio_slots`);
+                    for (const item of transactionData.items) {
+                        if (item.type === 'studio_booking' && item.bookedSlotId) {
+                            const bookedSlotDocRef = doc(bookedSlotsColRef, item.bookedSlotId);
+                            await updateDoc(bookedSlotDocRef, { status: 'available' });
+                        }
+                    }
+                    showAlert('Berhasil', `Transaksi ${transactionId} berhasil dibatalkan.`);
+                } else {
+                    showAlert('Error', 'Transaksi tidak ditemukan.');
+                }
+            } catch (error) {
+                console.error("Error canceling transaction:", error);
+                showAlert('Error', 'Gagal membatalkan transaksi. Silakan coba lagi.');
+                hideLoading();
+            } finally {
+                hideLoading();
             }
         }
 
         /**
-         * Merender daftar presensi karyawan.
+         * Renders the list of employee attendance from Firestore data.
          */
         function renderAttendance() {
             attendanceListBody.innerHTML = '';
@@ -1053,7 +1376,7 @@
         }
 
         /**
-         * Mengekspor data transaksi ke file Excel.
+         * Exports transaction data to an Excel file.
          */
         exportTransactionsExcelButton.addEventListener('click', () => {
             if (transactions.length === 0) {
@@ -1079,7 +1402,7 @@
         });
 
         /**
-         * Mengekspor data presensi ke file Excel.
+         * Exports attendance data to an Excel file.
          */
         exportAttendanceExcelButton.addEventListener('click', () => {
             if (attendance.length === 0) {
@@ -1101,11 +1424,12 @@
             showAlert('Berhasil', 'Data presensi berhasil diekspor ke Excel!');
         });
 
-        // --- Inisialisasi Aplikasi ---
+        // --- Application Initialization ---
         document.addEventListener('DOMContentLoaded', () => {
-            loadData();
+            initializeFirebase();
             initializeBookingDate();
             generateTimeSlots(); // Initial generation of time slots
+            renderCart(); // Render initial empty cart
         });
     </script>
 </body>
