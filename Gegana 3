@@ -1289,12 +1289,18 @@
 
         // --- Application Initialization ---
         document.addEventListener('DOMContentLoaded', () => {
-            initializeAppData(); // Load data from localStorage
-            initializeBookingDate();
-            generateTimeSlots(); // Initial generation of time slots
-            renderCart(); // Render initial empty cart
-            // Initial render of other sections will happen after login
-            showLoginPage(); // Show login page on initial load
+            // Wrap initializeAppData in a try-catch to prevent initialization errors from blocking the app
+            try {
+                initializeAppData(); // Load data from localStorage
+                initializeBookingDate();
+                generateTimeSlots(); // Initial generation of time slots
+                renderCart(); // Render initial empty cart
+                showLoginPage(); // Show login page on initial load
+            } catch (error) {
+                console.error("Error during application initialization:", error);
+                showAlert('Error', 'Gagal menginisialisasi aplikasi. Silakan coba lagi.');
+                hideLoading(); // Ensure loading is hidden even on error
+            }
         });
     </script>
 </body>
